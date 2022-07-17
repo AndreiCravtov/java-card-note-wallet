@@ -1,4 +1,4 @@
-# Java Card Bitcoin Note Pseudo-Wallet
+# Java Card Bitcoin Note pseudo-wallet
 
 ## Learning summary
 
