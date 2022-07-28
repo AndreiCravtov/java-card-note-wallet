@@ -3,14 +3,20 @@ import requests
 import json
 import os
 import binascii
+import colorama
+
+from sys import exit
 from ecdsa import util, VerifyingKey, SECP256k1
 from cryptos import Bitcoin
 from Crypto.Hash import SHA256, SHA512
+from colorama import Fore, Back, Style
 
 from src import *
 
 card_state: CardState = CardState()
 utxo_data: UTXOData = UTXOData()
+
+Blockchain = Bitcoin(testnet=True)
 
 def get_utxo_data(address: str) -> UTXOData:
     utxo_data: UTXOData = UTXOData()
@@ -31,11 +37,11 @@ def get_utxo_data(address: str) -> UTXOData:
     return utxo_data
  
 def connect_to_card() -> None:
-    # select the applet
+    # Select the applet
     if not APDU.select_applet(): raise Exception("Failed to connect to card...")
-    print("Connected to card")
+    print(Fore.GREEN + " - Connected to Smartcard" + Style.RESET_ALL)
 
-def establish_card_security() -> None:
+def check_lifecycle_state() -> None:
     global card_state
 
     apdu: APDU = APDU(APDU.get_apdu_bytes_from_string('B004000001'))
@@ -45,44 +51,52 @@ def establish_card_security() -> None:
     else:
         card_state.is_secure = True
 
-def get_wallet_balance() -> None:
+def fetch_wallet_balance() -> None:
     global card_state, utxo_data
 
-    # get uncompressed public key
+    # Fetch Uncompressed Public Key
     apdu: APDU = APDU(APDU.get_apdu_bytes_from_string('B000000041'))
     card_state.uncompressed_public_key = bytes(apdu.get_response_data())
 
-    # get compressed public key
+    # Fetch Compressed Public Key
     apdu = APDU(APDU.get_apdu_bytes_from_string('B000010021'))
     card_state.compressed_public_key = bytes(apdu.get_response_data())
 
-    # get p2pkh address
-    apdu = APDU(APDU.get_apdu_bytes_from_string('B001000019'))
-    card_state.p2pkh_address = base58.b58encode(bytes(apdu.get_response_data())).decode()
+    # Derive P2PKH Address
+    card_state.p2pkh_address = Blockchain.pubtoaddr(APDU.get_apdu_string_from_bytes(list(card_state.compressed_public_key)))
 
-    # get address balance
+    # Fetch Address Balance
     utxo_data = get_utxo_data(card_state.p2pkh_address)
     card_state.balance = utxo_data.value/100000000
 
-def verify_address_ownership() -> None:
+def verify_wallet_ownership() -> None:
     global card_state
 
-    # verify that the address is derrived from the public key correctly
-    if card_state.p2pkh_address != Bitcoin(testnet=True).pubtoaddr(APDU.get_apdu_string_from_bytes(list(card_state.compressed_public_key))):
-        raise Exception("Address doesn't belong to the public key...")
-
-    # verify that the card owns the public key
+    # Verify possession of Private Key
     nonce: bytes = os.urandom(32)
+    
     apdu: APDU = APDU([0xB0, 0x02, 0x00, 0x00, 0x20]+list(nonce)+[0x48])
+    
     nonce_signature: bytes = bytes(apdu.get_response_data())
     sha512 = SHA512.new(data=nonce)
     sha256 = SHA256.new(data=sha512.digest())
     nonce_hash: bytes = sha256.digest()
+    
     verifying_key = VerifyingKey.from_string(card_state.uncompressed_public_key, curve=SECP256k1)
+    
     try:
         verified = verifying_key.verify_digest(signature=nonce_signature, digest=nonce_hash, sigdecode=util.sigdecode_der)  # type: ignore
         if not verified: raise Exception()
     except: raise Exception("Public key doesn't belong to card...")
+
+def display_debug_information() -> None:
+    global card_state
+    
+    print(
+      '\n' +
+      f'  Uncompressed Public Key: {card_state.uncompressed_public_key.hex().upper()}\n' + 
+      f'  Compressed Public Key: {card_state.compressed_public_key.hex().upper()}'
+    )
 
 def spend_note() -> None:
     global card_state, utxo_data
@@ -90,11 +104,11 @@ def spend_note() -> None:
     # update utxo data
     utxo_data = get_utxo_data(card_state.p2pkh_address)
     if utxo_data.value == 0:
-        print("\nBalance is empty. Please top up first")
+        print("\nError: There are no funds stored in the wallet to spend.")
         return
 
     # get recepient address
-    print("\nEnter the receiver address")
+    print("\nSpecify the Receiver Address")
     while True:
         try:
             receiver_address: bytes = input('> ').encode()
@@ -151,37 +165,57 @@ def spend_note() -> None:
     final_transaction: bytes = Transaction.VERSION + Transaction.NUMBER_OF_INPUTS + previous_tx_hash + previous_output_index + script_sig_length + script_sig + Transaction.SEQUENCE + Transaction.NUMBER_OF_OUTPUTS + value + script_pub_key_length + script_pub_key + Transaction.LOCKTIME
     transaction_hex: str = binascii.hexlify(final_transaction).decode('utf-8')
 
-    establish_card_security()
+    check_lifecycle_state()
 
     txid: str = requests.post(f'https://blockstream.info/testnet/api/tx', transaction_hex).text
     print("\nCard successfuly spent")
     print(f"The pending transaction ID is {txid}")
 
-    get_wallet_balance()
+    fetch_wallet_balance()
     
 
 def reset_card() -> None:
     apdu: APDU = APDU(APDU.get_apdu_bytes_from_string('B005000000'))
     if APDU.get_apdu_string_from_bytes(apdu.get_response_sw()) != '9000': raise Exception("Reset failed...")
-    print("\nReset complete")
-    establish_card_security(); print("Card security retrieved")
-    get_wallet_balance(); print(f"Obtained address balance")
-    verify_address_ownership(); print("Address belongs to the public key\nPublic key belongs to card")
+    
+    print("The Smartcard has been reset.")
+    
+    check_lifecycle_state(); print(Fore.GREEN + " - Card State Retrieved")
+    fetch_wallet_balance(); print(Fore.GREEN + " - Obtained Wallet Balance")
+    verify_wallet_ownership(); print(Fore.GREEN + " - Verified Ownership" + Style.RESET_ALL)
 
 def display_main_menu() -> None:
     global card_state
 
-    print(f'\nInfo:\n\tCard: {"is" if (card_state.is_secure) else "is NOT"} secure\n\tUncompressed public key: {card_state.uncompressed_public_key.hex().upper()}\n\tCompressed public key: {card_state.compressed_public_key.hex().upper()}\n\tAddress: {card_state.p2pkh_address}\n\tConfirmed balance: {card_state.balance} BTC\n\nMain Menu:\n\t1) Quit\n\t2) Spend note\n\t3) Reset card\n\nPick an option')
+    print(
+      '\nSmartcard Status:\n' + 
+      Style.DIM +
+      f'  The banknote {"has not been spent." if (card_state.is_secure) else Style.RESET_ALL + Fore.RED + "may have been spent." + Style.RESET_ALL + Style.DIM}\n' +
+      f'  Wallet Address: {card_state.p2pkh_address}\n' +
+      f'  Confirmed balance: {card_state.balance} BTC\n' +
+      Style.RESET_ALL
+    )
+    print(
+      'Options:\n' +
+      Style.DIM +
+      '  1) Quit\n' +
+      '  2) Spend Banknote\n' +
+      '  3) Erase and Reset Banknote\n' +
+      '  4) Debug Information\n\n' +
+      Style.RESET_ALL
+    )
+
 
 def main()-> None:
     global card_state, utxo_data
-
+    
+    print('')
+    
     connect_to_card()
-    establish_card_security(); print("Card security retrieved")
-    get_wallet_balance(); print(f"Obtained address balance")
-    verify_address_ownership(); print("Address belongs to the public key\nPublic key belongs to card")
+    check_lifecycle_state(); print(Fore.GREEN + " - Card State Retrieved")
+    fetch_wallet_balance(); print(Fore.GREEN + " - Obtained Wallet Balance")
+    verify_wallet_ownership(); print(Fore.GREEN + " - Verified Ownership" + Style.RESET_ALL)
 
-    print("\nWelcome to Sterling Notes")
     while True:
         display_main_menu()
 
@@ -189,7 +223,7 @@ def main()-> None:
         while True:
             try:
                 choice: int = int(input('> '))
-                if choice in range(1, 4): break
+                if choice in range(1, 5): break
             except: pass
         
         if choice == 1:
@@ -198,6 +232,8 @@ def main()-> None:
             spend_note()
         elif choice == 3:
             reset_card()
+        elif choice == 4:
+            display_debug_information()
 
 if __name__ == "__main__":
     main()
